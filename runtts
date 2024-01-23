@@ -1,0 +1,472 @@
+#!/bin/sh
+
+. ~/runtts/config
+
+mkdir -p ~/runtts/contexts
+mkdir -p ~/runtts/readings
+
+genid() {
+  date +%s
+}
+
+cleanup() {
+  for cleanid in $RTZPID $RTTPID $RTCPID $RTVPID $RTRPID $RTGPID $RTLPID; do
+    if kill -0 $cleanid; then
+      kill $cleanid
+    fi
+  done
+  for tmpf in $TMP_ZRES $TMP_FMTS $TMP_READ; do
+    if [ -e "$tmpf" ]; then
+      rm "$tmpf"
+    fi
+  done
+}
+
+trap cleanup EXIT
+
+CUR_DIR=~/runtts/contexts/current
+
+RUN_ID=$(genid)
+
+# Check arguments for a context path
+
+if [ -n "$1" ]; then
+  echo "Context Loaded: $1"
+  CTX_FLDR="$1"
+  ACTIVE_DIR="$1/runs/$RUN_ID"
+  if [ "$1" = "$CUR_DIR" ]; then
+    NOT_SAVED=1
+  else
+    NOT_SAVED=0
+  fi
+else
+  CTX_FLDR="$CUR_DIR"
+  ACTIVE_DIR="$CUR_DIR/runs/$RUN_ID"
+  NOT_SAVED=1
+fi
+
+# If there's already an ongoing contexts/current context, allow for continuing
+
+if [ -s "$CTX_FLDR/context.jsonp" ] && [ ! -n "$1" ]; then
+  CONTINUE_BTN="Continue"
+fi
+
+# Prompts
+
+PROMPT_TYPE=$(zenity --list --ok-label="Select" --width=150 --height=300 --column= --hide-header $CONTINUE_BTN Load Speak Write "Speak and Write" Read Configure)
+
+if [ $? -eq 1 ]; then
+  exit 1
+fi
+
+# Configuration
+
+if [ "$PROMPT_TYPE" = "Configure" ]; then
+
+  OPT_SELECT=$(zenity --list --title="Change Configuration" --column= --hide-header TTS_MODEL TTS_VOCODER OLLAMA_MODEL SYSTEM_ROLE)
+
+  if [ $? -eq 1 ]; then
+    exit 1
+  fi
+
+  CUR_OPT="$(eval "echo \$$OPT_SELECT")"
+
+  TMP_OPT=$(mktemp)
+
+  echo "$CUR_OPT" > $TMP_OPT
+
+  NEW_OPT=$(zenity --text-info --filename="$TMP_OPT" --editable | awk '{ printf "%s\\n", $0 }' | sed 's/\\n/\\\\n/g')
+
+  if [ $? -eq 1 ]; then
+    rm $TMP_OPT
+    exit 1
+  fi
+  
+  rm $TMP_OPT  
+
+  if [ -n "$NEW_OPT" ]; then
+    sed -i 's/^'"$OPT_SELECT"'=.*/'"$OPT_SELECT"'="'"$(printf '%s' "$NEW_OPT")"'"/g' ~/runtts/config
+  fi
+
+  exec ~/runtts/runtts
+  exit 0
+fi
+
+# Continuing or Loading contexts
+
+if [ "$PROMPT_TYPE" = "Continue" ]; then
+
+  ~/runtts/runtts "$CUR_DIR"
+  exit 0
+
+elif [ "$PROMPT_TYPE" = "Load" ]; then
+
+  FLDRS=""
+
+  for dir in ~/runtts/contexts/*/; do
+
+    dir="${dir%*/}"
+    dir="${dir##*/}"
+
+    if [ "$dir" = "current" ] ; then continue; fi
+
+    if [ -n "$FLDRS" ]; then
+      FLDRS="$FLDRS|"
+    fi
+
+    FLDRS="$FLDRS$dir"
+
+  done
+
+  echo $FLDRS
+
+  FLDR_FORM=$(zenity --forms --ok-label="Select" --add-list="Contexts" --list-values="$FLDRS" --add-combo="Options" --combo-values="Delete")
+
+  if [ $? -eq 1 ]; then
+    exec ~/runtts/runtts
+    exit 0
+  fi
+
+  FLDR_SELECT=~/runtts/contexts/"${FLDR_FORM%,|*}"
+  FLDR_OPT="${FLDR_FORM#*,|}"
+
+  if [ "$FLDR_OPT" = "Delete" ]; then
+    rm -rf "$FLDR_SELECT"
+    exec ~/runtts/runtts 
+  else
+    exec ~/runtts/runtts "$FLDR_SELECT"
+  fi
+
+  exit 0
+fi
+
+# Reading
+
+if [ "$PROMPT_TYPE" = "Read" ]; then
+  READ_FILE=$(mktemp)
+  READ_PROMPT=$(zenity --text-info --editable --title="Reading Contents")
+  
+  if [ $? -eq 1 ]; then
+    exit 1
+  fi
+
+  PROMPT_FMT=$(echo "$READ_PROMPT" | sed '/^\s*$/d')
+
+  echo "$READ_PROMPT" > $READ_FILE
+
+  rm ~/runtts/readings/*
+  
+  READINGS=$(echo "$PROMPT_FMT" | wc -l)
+
+  zenity --text-info --filename="$READ_FILE" --title="Reading" --width=400 --height=600 --cancel-label= --ok-label="Exit" & 
+  RTZPID=$!
+
+  if [ -n "$TTS_VOCODER" ]; then
+    VOCODER_OPT="--vocoder_name=\"$TTS_VOCODER\""
+  fi
+
+  tts-server --use_cuda true --model_name "$TTS_MODEL" $VOCODER_OPT &
+  RTTPID=$!
+
+  until $(curl --output /dev/null --silent --head --fail http://localhost:5002); do
+    echo "waiting for tts server"
+    sleep 5
+  done
+
+  CURRENT_READING=1
+  
+  while [ $CURRENT_READING -ne $(($READINGS+1)) ]; do
+
+    READING="$(echo "$PROMPT_FMT" | sed "${CURRENT_READING}q;d")"
+    READING_WAV=~/runtts/readings/"$CURRENT_READING".wav
+
+    curl -G http://localhost:5002/api/tts --data-urlencode "text=$READING" > "$READING_WAV"    
+
+    RTGPID=$!
+
+    while [ ! -e "$READING_WAV" ] || kill -0 $RTRPID > /dev/null 2>&1; do
+      if ! ps -p $RTZPID > /dev/null; then
+        kill $RTRPID $RTGPID $RTTPID
+       
+        exit 1
+      fi
+      sleep 1
+    done
+
+    aplay -i "$READING_WAV" &
+
+    RTRPID=$!
+    CURRENT_READING=$(($CURRENT_READING+1))
+  done
+
+  wait $RTRPID
+
+  kill $RTTPID $RTRPID $RTGPID $RTZPID
+  exit 1
+fi
+
+# Speaking and Writing
+
+if [ ! -n "$1" ] && [ -s ~/runtts/contexts/current/context.jsonp ]; then
+  TEXT_PROMPT=$(zenity --question --title="Overwrite Existing?" --text="This will overwrite your existing session. Continue?")
+
+  if [ $? -eq 1 ]; then
+    exit 1
+  fi
+
+  rm -rf ~/runtts/contexts/current/*
+fi
+
+mkdir -p "$ACTIVE_DIR"
+
+if [ "$PROMPT_TYPE" = "Write" ] || [ "$PROMPT_TYPE" = "Speak and Write" ]; then
+
+  if [ ! -n "$1" ]; then
+    rm -rf ~/runtts/contexts/current/*
+    mkdir -p "$ACTIVE_DIR"
+  fi
+
+  TEXT_PROMPT=$(zenity --text-info --editable --title="Prompt")
+
+  if [ $? -eq 1 ]; then
+    exit 1
+  fi
+elif [ "$PROMPT_TYPE" = "Speak" ] || [ "$PROMPT_TYPE" = "Speak and Write" ]; then
+
+  if [ ! -n "$1" ]; then
+    rm -rf ~/runtts/contexts/current/*
+    mkdir -p "$ACTIVE_DIR"
+  fi
+
+  ffmpeg -f pulse -i default -y "$ACTIVE_DIR/prompt.wav" &
+
+  RTVPID=$!
+
+  sleep 1
+
+  zenity --question --cancel-label="Cancel" --ok-label="Done" --text="Press Done when finished recording."
+
+  ZRES=$?
+
+  kill $RTVPID
+
+  if [ $ZRES -eq 1 ]; then
+    exit 1
+  fi
+
+  whisper --output_dir="$ACTIVE_DIR" --output_format txt "$ACTIVE_DIR/prompt.wav"
+
+  VOICE_PROMPT="$(<"$ACTIVE_DIR/prompt.txt")"
+fi
+
+if [ -n "$VOICE_PROMPT" ]; then
+  USER_PROMPT="$VOICE_PROMPT\n\n"
+fi
+
+if [ -n "$TEXT_PROMPT" ]; then
+  USER_PROMPT="$USER_PROMPT$TEXT_PROMPT"
+fi
+
+# Prompt ollama
+
+DATA='{
+  "model": "'"$OLLAMA_MODEL"'",
+  "messages": [
+    { "role": "system", "content": "'"$(echo $SYSTEM_ROLE)"'" },
+    { "role": "assistant", "content": "Please provide a request." },
+    '"$(cat "$CTX_FLDR/context.jsonp")"'
+    '"$(jq -n --arg userPrompt "$USER_PROMPT" '{ role: "user", content: $userPrompt }')"'
+  ],
+  "stream": true
+
+}' 
+
+echo "SENDING DATA $DATA"
+
+# 32768
+# "options": {
+#     "num_ctx": 2048,
+#     "num_gpu": 20
+#   },
+  # "options": {
+  #   "num_ctx": 8000,
+  #   "num_gpu": 20 
+  # }
+FORMATTED_RESPONSE_FILE="$ACTIVE_DIR/formatted_response.txt"
+CODE_BLOCKS_FILE="$ACTIVE_DIR/code_blocks.txt"
+
+tts-server --use_cuda true --model_name "$TTS_MODEL" $VOCODER_OPT > /dev/null 2>&1 &
+RTTPID=$!
+
+SENTENCE=""
+CAN_WRITE=1
+BLOCK_COUNT=0
+NEWLINE=0
+
+TMP_READ=$(mktemp)
+TMP_ZRES=$(mktemp)
+TMP_FMTS=$(mktemp)
+
+> "$FORMATTED_RESPONSE_FILE"
+
+curl -s -X POST http://localhost:11434/api/chat -d "$DATA" | while IFS= read -r line; do
+
+  ERROR="$(printf '%s' "$line" | jq '.error')"
+  DONE="$(printf '%s' "$line" | jq '.done')"
+  if [ ! "$ERROR" = "null" ]; then
+    echo "ERROR: $ERROR"
+    zenity --info --text="Error: $ERROR"
+    sleep 30
+    exit 1
+  fi
+
+  echo "$line"
+
+
+  FMT="$(printf '%s' "$line" | sed 's/\\n/\\\\n/g' | jq -r '.message.content')"
+
+  if [ "$FMT" = "\n" ]; then
+    NEWLINE=1
+  fi
+  
+  SENTENCE="$SENTENCE$FMT"
+
+  if [ "$DONE" = "true" ] || [ "$NEWLINE" -eq 1 ]; then 
+
+    BACKTICK_COUNT="$(echo "$SENTENCE" | grep -c "\`\`\`")"
+
+    if [ "$BACKTICK_COUNT" -eq 1 ] || [ "$BACKTICK_COUNT" -eq 2 ]; then # If there is a backtick group, don't write sentence for now
+
+      CAN_WRITE=0
+
+      if [ "$BACKTICK_COUNT" -eq 2 ]; then # Capture complete backtick block and remove it replacing the blocks with a denoting message
+        CODE_BLOCK="$(echo "$SENTENCE" | sed -n '/^```/,/^```/p')"
+        
+        SENTENCE="$(echo "$SENTENCE" | awk -v block_count="$BLOCK_COUNT" '
+          BEGIN { in_block = 0; }
+          /```/ {
+            if (in_block) {
+              in_block = 0;
+            } else {
+              in_block = 1;
+              block_count++;
+              print "See block " block_count ".";
+            }
+            next;
+          }
+          !in_block { print; }
+        ')"
+
+        BLOCK_COUNT=$(($BLOCK_COUNT + 1))
+
+        echo "\nBlock $BLOCK_COUNT\n$CODE_BLOCK" >> "$CODE_BLOCKS_FILE"
+
+        CAN_WRITE=1
+      fi
+
+    fi
+
+    if [ "$CAN_WRITE" -eq 1 ]; then
+      SENTENCE="$(echo "$SENTENCE" | awk '{$1=$1};1' | sed 's/\\n//g')"
+      if [ -n "$SENTENCE" ]; then
+        echo "Writing: $SENTENCE"
+        echo "$SENTENCE" >> "$TMP_FMTS"
+        echo "$SENTENCE" >> "$FORMATTED_RESPONSE_FILE"
+      fi
+      SENTENCE=""
+      NEWLINE=0
+    fi
+  fi
+
+  if [ "$DONE" = "true" ]; then
+    cat "$FORMATTED_RESPONSE_FILE" "$CODE_BLOCKS_FILE" > "$TMP_READ"
+    break
+  fi
+
+done & 
+RTLPID=$!
+
+until [ -s "$TMP_FMTS" ]; do
+  echo "waiting for formatted response"
+  sleep 1
+done
+
+until $(curl -s -I -f http://localhost:5002 -o /dev/null); do
+  echo "waiting for tts server"
+  sleep 1
+done
+
+while : ; do
+
+  if [ -s "$TMP_FMTS" ]; then
+
+    while IFS= read -r readerline; do
+
+      if [ -n "$readerline" ]; then
+        curl -s -G http://localhost:5002/api/tts --data-urlencode "text=$readerline" | aplay &
+        RTGPID=$!
+      fi
+
+      while kill -0 "$RTGPID" > /dev/null 2>&1; do
+        if [ -s "$TMP_ZRES" ]; then
+          kill $RTGPID > /dev/null 2>&1
+          break
+        fi
+        sleep 1
+      done
+
+    done < "$TMP_FMTS"
+    
+    > "$TMP_FMTS"
+  fi
+
+  if [ -s "$TMP_READ" ]; then
+    break
+  fi
+
+done &
+RTRPID=$!
+
+until [ -s "$TMP_READ" ]; do
+  sleep 1
+done
+
+if [ $NOT_SAVED -eq 1 ]; then
+  SAVE_BTN='--extra-button=Save'
+fi
+
+SAVED=$(zenity --text-info --title="Response" --filename="$TMP_READ" --ok-label="Continue" --cancel-label="Done" $SAVE_BTN)
+ZOPT=$?
+RTZPID=$!
+
+echo "$RTZPID" > "$TMP_ZRES"
+
+sleep 1
+
+echo "$USER_PROMPT"',\n{ "role": "assistant", "content": "'"$(cat "$TMP_READ")"'" },' >> "$CTX_FLDR/context.jsonp"
+
+if [ ! -n "$SAVED" ] && [ "$ZOPT" -eq 1 ]; then
+  exit 1
+fi
+
+if [ -n "$SAVED" ]; then # Save the conversation 
+  CTX_FLDR=~/runtts/contexts/"$(zenity --entry --text="Name" --title="Save Chat")"
+
+  if [ $? -eq 1 ]; then
+    exit 1
+  fi
+
+  mkdir -p "$CTX_FLDR"
+  mv ~/runtts/contexts/current/* "$CTX_FLDR"
+elif [ "$ZOPT" -eq 0 ]; then # Continue the conversation
+  if [ "$NOT_SAVED" -eq 1 ]; then
+    CTX_FLDR=~/runtts/contexts/current
+  else
+    CTX_FLDR="$1"
+  fi
+fi
+
+cleanup
+
+exec ~/runtts/runtts "$CTX_FLDR"
+
